@@ -1,0 +1,25 @@
+
+## install libraries 
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("GEOquery")
+library(GEOquery)
+
+```
+
+## load data from GEOquery
+dataset: GSE283536
+```{r}
+data_GEO <- getGEO("GSE283536", GSEMatrix = TRUE)
+expression_data <- exprs(data_GEO[[1]])
+# check the dimensions of the expression matrix
+dim(expression_data)
+print(expression_data[1:4, 1:4])
+```
+
+
+
+
+

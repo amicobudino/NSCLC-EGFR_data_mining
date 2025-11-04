@@ -1,0 +1,62 @@
+
+## install libraries 
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("GEOquery")
+library(GEOquery)
+
+```
+
+
+load the data from the file
+dataset: GSE278221 -- atac seqeuncing of HCC827 cell line treated with osimertinib
+
+## load the data from a local file
+
+```{r}
+path_GSE <- "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/data/RNA/expression_matrices/GSE278222_HCC827_counts.txt"
+# it is a feature count file coming from rnaseq parse it the following way 
+full_data <- read.delim(
+    file = path_GSE,
+    header = TRUE,
+    comment.char = "#"
+)
+
+# extract the espression matrix columns 7 to the end
+expression_matrix <- full_data[ , 7:ncol(full_data)]
+
+#use the first column "Geneid" as row names
+rownames(expression_matrix) <- full_data$Geneid
+
+# check the new clean matrix
+dim(expression_matrix)
+print(expression_matrix[1:5, 1:5])
+
+```
+## get data from GEO database
+
+```{r}
+data_GEO <- getGEO("GSE278221", GSEMatrix = TRUE)
+expression_data <- exprs(data_GEO[[1]])
+# check the dimensions of the expression matrix
+dim(expression_data)
+print(head(expression_data))
+```
+
+## get the datat from the supplementary files
+```{r}
+supp_files <- getGEOSuppFiles("GSE278221")
+# check the downloaded files
+list.files("GSE278221")
+# define the file path
+file_path <- "GSE278221/GSE278221_consensus_peaks.mLb.clN.featureCounts.txt.gz"
+# Load the full file, skipping the '#' comment lines
+full_data <- read.delim(
+  file = file_path, 
+  header = TRUE, 
+  comment.char = "#"
+)
+head(full_data)
+```
