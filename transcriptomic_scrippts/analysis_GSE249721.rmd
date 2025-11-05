@@ -1,0 +1,162 @@
+
+
+## load data from GEO database - GSE249721
+
+```{r}
+library(GEOquery)
+```
+
+## get the datat from the supplementary files
+```{r}
+# download the supplementary files and save them in a specific folder
+path_save <- "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/data/RNA/expression_matrices"
+supp_files <- getGEOSuppFiles("GSE249721", baseDir = path_save)
+# check the downloaded files
+list.files(path_save)
+# get the file name
+file_path <- rownames(supp_files)[1]
+# Load the full file, skipping the '#' comment lines
+full_data <- read.delim(
+  file = file_path, 
+  header = TRUE, 
+  comment.char = "#"
+)
+head(full_data)
+```
+
+save data frame as RDS file for future use
+```{r}
+path_1 <- "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/data/RNA/expression_matrices/GSE249721"
+matrix_path <- file.path(path_1, "GSE249721_full_data.rds")
+saveRDS(full_data, file = matrix_path)
+```
+
+load the RDS file
+```{r}
+matrix_path <- "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/data/RNA/expression_matrices/GSE249721/GSE249721_full_data.rds"
+full_data <- readRDS(file = matrix_path)
+head(full_data) 
+dim(full_data)  
+````
+
+### extract the expression matrix of the HCC827 cell line
+```{r}
+# subset the data for HCC827 samples
+hcc827_data <- full_data[, grepl("HCC827", colnames(full_data))]
+# check the dimensions of the subsetted data
+dim(hcc827_data)
+print(hcc827_data[1:6, 1:6])
+```
+
+## preprocessing the data
+
+create groups based on treatment conditions
+the two groups are: "Osimertinib" and "Untreated"
+```{r}
+# create a new data frame with the sample names and their corresponding groups
+sample_info <- data.frame(
+  Sample = colnames(hcc827_data),
+  Group = ifelse(grepl("Osimertinib", colnames(hcc827_data)), "Osimertinib", "Untreated")
+)
+
+# check the sample information
+head(sample_info)
+```
+
+ create a box plot to visualize the distribution of expression values across samples, include the two groups with different colors
+```{r}
+png(filename = "hcc827_expression_boxplot.png", width = 800, height = 600)
+boxplot(hcc827_data, 
+        main = "Boxplot of HCC827 Expression Data",
+        xlab = "Samples",
+        ylab = "Expression Values",
+        las = 2, # rotate x-axis labels for better readability
+        col = ifelse(sample_info$Group == "Osimertinib", "lightblue", "lightgreen"))
+        legend("topright", legend = c("Osimertinib", "Untreated"), fill = c("lightblue", "lightgreen"))
+dev.off()
+
+```
+
+as the expression values are between 0 and 15 we can asume the data has been alread log2 transformed 
+
+```{r}
+library(limma)
+
+# --- NEW FILTERING STEP ---
+# 1. Calculate the variance for every gene (row)
+gene_variances <- apply(hcc827_data, 1, var)
+
+# 2. Keep only genes that have a variance greater than 0
+# (You could even use a higher threshold, like 0.1, to be stricter)
+keep <- gene_variances > 0
+filtered_data <- hcc827_data[keep, ]
+
+# 3. See how many genes we kept
+print(paste("Original genes:", nrow(hcc827_data)))
+print(paste("Filtered genes:", nrow(filtered_data)))
+# --- END OF FILTERING ---
+
+
+# 4. Create the design matrix (same as before)
+design <- model.matrix(~ 0 + Group, data = sample_info)
+colnames(design) <- c("Osimertinib", "Untreated")
+contrast.matrix <- makeContrasts(Osimertinib - Untreated, levels = design)
+
+# 5. Fit the model *on the filtered data*
+fit <- lmFit(filtered_data, design) # <-- Use filtered_data
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+
+# 6. Get the results (which should now be much more reasonable)
+top_genes <- topTable(fit2, n = Inf)
+
+# 7. Check the new, more realistic results
+print(head(top_genes))
+
+# 8. NOW, look for your gene
+# (Replace "THE_REAL_GENE_NAME" with what you found in the grep step)
+# "THE_REAL_GENE_NAME" %in% rownames(top_genes)
+# check the gene names
+print(rownames(top_genes)[1:20])
+# the gene names are numbers of 4 digits
+# ------------------------------
+# ------------------------------
+# Load the annotation library
+library(org.Hs.eg.db)
+
+# 1. Get the Entrez IDs from your results
+entrez_ids <- rownames(top_genes)
+
+# 2. Use the 'mapIds' function to translate them
+# We are telling it: "Here are Entrez IDs, please give me the SYMBOLs"
+gene_symbols <- mapIds(org.Hs.eg.db,
+                       keys = entrez_ids,
+                       column = "SYMBOL",
+                       keytype = "ENTREZID",
+                       multiVals = "first")
+
+# 3. Add these new symbols as a column to your results
+top_genes$symbol <- gene_symbols
+
+# 4. Check the results!
+print(head(top_genes, 20))
+```
+
+
+focus on finding the id for EGFR gene and its expression results
+
+```{r}
+library(org.Hs.eg.db)
+
+egfr_id <- mapIds(org.Hs.eg.db,
+                  keys = "EGFR",
+                  column = "ENTREZID",
+                  keytype = "SYMBOL")
+
+print(egfr_id)
+# check if EGFR is in the results
+"1910" %in% rownames(top_genes) # -> TRUE
+# extract the EGFR row
+egfr_results <- top_genes["1910", ]
+print(egfr_results)
+```

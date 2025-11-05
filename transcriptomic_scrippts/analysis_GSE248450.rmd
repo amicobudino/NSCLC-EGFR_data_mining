@@ -1,0 +1,56 @@
+
+
+## get data
+```{r}
+# download the supplementary files and save them in a specific folder
+path_save <- "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/data/RNA/expression_matrices"
+supp_files <- getGEOSuppFiles("GSE248450", baseDir = path_save)
+# check the downloaded files
+list.files(path_save)
+# get the file name
+file_path <- rownames(supp_files)[1]
+# Load the full file, skipping the '#' comment lines
+full_data <- read.delim(
+  file = file_path, 
+)
+print(full_data[0:5, 0:5])
+dim(full_data)
+# save the data frame as RDS file for future use
+matrix_path <- "uni/semestre3/laboratory_bio_datamining/assessing_mutation_frequency_EGFR_NSCLC/singlle_cell_analysis/data/GSE248450_full_data.rds"
+saveRDS(full_data, file = matrix_path)
+```
+
+### load data 
+```{r}
+# load the RDS file
+matrix_path <- "uni/semestre3/laboratory_bio_datamining/assessing_mutation_frequency_EGFR_NSCLC/singlle_cell_analysis/data/GSE248450_full_data.rds"
+full_data <- readRDS(file = matrix_path)
+```
+
+## process data
+
+check the list of analyzed genes, to do this we can use the rownames of the data frame
+```{r}
+gene_list <- colnames(full_data)
+# remove the first column which contains the cell barcodes
+gene_list <- gene_list[-1]
+length(gene_list)
+head(gene_list)
+# get the list of cell barcodes
+cell_list <- full_data[,1]
+length(cell_list)
+tail(cell_list)
+``` 
+
+check the presence of EGFR in the gene list
+```{r}
+"EGFR" %in% gene_list
+# check the presence of alias
+"ERBB1" %in% gene_list
+"ERBB" %in% gene_list
+"ERBB2" %in% gene_list
+"ERBB3" %in% gene_list
+"ERBB4" %in% gene_list
+```
+
+there is not the EGFR gene in the dataset, so we cannot proceed with the analysis of its mutation frequency in single cells.
