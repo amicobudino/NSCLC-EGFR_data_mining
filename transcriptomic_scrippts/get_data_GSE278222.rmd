@@ -1,0 +1,342 @@
+
+## install libraries 
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("GEOquery")
+BiocManager::install("DESeq2")
+BiocManager::install("apeglm")
+```
+```{r}
+library(GEOquery)
+
+
+library(DESeq2)
+
+
+
+library(apeglm)
+```
+
+
+load the data from the file
+dataset: GSE278222_HCC827_counts.txt
+
+```{r}
+path_GSE <- "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/data/RNA/expression_matrices/GSE278222_HCC827_counts.txt"
+# it is a feature count file coming from rnaseq parse it the following way 
+full_data <- read.delim(
+    file = path_GSE,
+    header = TRUE,
+    comment.char = "#"
+)
+
+# extract the espression matrix columns 7 to the end
+expression_matrix <- full_data[ , 7:ncol(full_data)]
+
+#use the first column "Geneid" as row names
+rownames(expression_matrix) <- full_data$Geneid
+
+# check the new clean matrix
+dim(expression_matrix)
+print(expression_matrix[1:6, 1:6])
+
+# save the expression matrix as rds file for future use
+saveRDS(expression_matrix, file = "/Users/alvise/Downloads/GSE278222_expression_matrix.rds")
+```
+
+## load the data form the supplementary files
+```{r}
+# download the supplementary files and save them in a specific folder
+path_1 <- "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/data/RNA/expression_matrices/GSE278222"
+supp_files <- getGEOSuppFiles("GSE278222", baseDir = path_1)
+# check the downloaded files
+list.files(path_1)
+```
+
+# load the rds file
+```{r}
+matrix_path <- "/Users/alvise/Downloads/GSE278222_expression_matrix.rds"
+expression_matrix <- readRDS(file = matrix_path)
+head(expression_matrix)
+```
+
+## preprocessing the data
+
+create groups based on treatment conditions
+the two groups are: "Osimertinib" and "Untreated"
+```{r}
+# check the column names to identify treatment conditions
+colnames(expression_matrix)
+# one group is OsiR and the other is HCC827 then there is a dot and a number
+
+# create a new data frame with the sample names and their corresponding groups
+sample_info <- data.frame(
+    Sample = colnames(expression_matrix),
+    Group = ifelse(grepl("OsiR", colnames(expression_matrix)), "Osimertinib", "Untreated")
+)   
+# check the sample information
+head(sample_info)
+```
+
+## check the distribution of gene expression in samples in each group
+create a boxplot to visualize the distribution of expressionvalue across smaples. 
+include the two groups with different colors. 
+save image here: laboratory_bio_datamining/assessing_mutation_frequency_EGFR_NSCLC/RNA_data_analysis/images
+
+
+```{r}
+png(filename = "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/assessing_mutation_frequency_EGFR_NSCLC/RNA_data_analysis/images/GSE278222_boxplot_expression_values.png",
+    width = 800, height = 600)
+boxplot(expression_matrix,
+        main = "Gene Expression Distribution in HCC827 Cell Line Samples (GSE278222)",
+        xlab = "Samples",
+        ylab = "Expression Values",
+        col = ifelse(sample_info$Group == "Osimertinib", "lightblue", "lightgreen"),
+        las = 2, # rotate x-axis labels for better readability
+        outline = FALSE) # remove outliers for better visualization
+dev.off()
+
+## print the highes and lowest expression values to check normalization
+print(paste("Maximum expression value:", max(expression_matrix)))
+print(paste("Minimum expression value:", min(expression_matrix)))
+```
+
+The original paper seel link: https://www.nature.com/articles/s41419-025-07711-z#Sec2
+The data is NOT normalized or log transformed. values range form 0 to approx 6 million. 
+
+## for this reason we procede with differential expression analysis using deseq2
+
+```{r}
+# 1. Create the DESeqDataSet (DDS) object
+# This object stores your counts and sample info together
+dds <- DESeqDataSetFromMatrix(
+  countData = expression_matrix,
+  colData = sample_info,
+  design = ~ Group  # Tell DESeq2 to model based on the "Group" column
+)
+
+# 2. (Optional but Recommended) Pre-filtering
+# This removes genes with almost no counts, speeding up the analysis.
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep, ]
+
+# 3. Set the baseline group (CRITICAL)
+# We must tell DESeq2 that "Untreated" is the baseline for comparison.
+dds$Group <- relevel(dds$Group, ref = "Untreated")
+
+# 4. Run the main DESeq2 analysis
+# This one command handles normalization, dispersion estimation, and fitting.
+dds <- DESeq(dds)
+
+# 5. Get the results table
+# This extracts the comparison: "Osimertinib" vs. "Untreated"
+res <- results(dds, name = "Group_Osimertinib_vs_Untreated")
+
+# 6. (Optional but Recommended) Get "shrunken" results for better visualization
+# This shrinks the log-fold changes for low-count genes, making them more reliable.
+# You may need to install this: BiocManager::install("apeglm")
+resLFC <- lfcShrink(dds, coef = "Group_Osimertinib_vs_Untreated", type = "apeglm")
+
+# 7. Check your final results!
+# Summary of how many genes are significant:
+summary(res)
+
+# View the top genes from the shrunken results (best for plotting):
+print("Top significant genes (shrunken LFC):")
+print(head(resLFC[order(resLFC$padj), ]))
+```
+
+### add gene symbols
+clean up the gene ids and convert them to gene symbols and add them to the results table
+
+```{r}
+# 1. Install/load the human genome annotation database
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+# BiocManager::install("org.Hs.eg.db")
+library(org.Hs.eg.db)
+
+# 2. Get the Ensembl IDs from your DESeq2 results
+ensembl_ids_with_version <- rownames(resLFC)
+
+# 3. Clean the IDs (remove the ".9", ".16" etc.)
+# This finds the dot "." and everything after it, and replaces it with nothing.
+ensembl_ids_cleaned <- sub("\\..*", "", ensembl_ids_with_version)
+
+# 4. Use mapIds to translate the *cleaned* IDs
+gene_symbols <- mapIds(org.Hs.eg.db,
+                       keys = ensembl_ids_cleaned,
+                       column = "SYMBOL",
+                       keytype = "ENSEMBL",
+                       multiVals = "first")
+
+# 5. Add the symbols as a new column to your results table
+# We match the cleaned IDs to the map to re-order them correctly
+resLFC$symbol <- gene_symbols[ensembl_ids_cleaned]
+
+# 6. Check your new, readable results!
+print("Results with gene symbols:")
+print(head(resLFC[order(resLFC$padj), ]))
+```
+
+check the expression results for EGFR gene
+```{r}
+# --- 2. THIS IS THE CORRECT WAY TO LOOK FOR EGFR ---
+# Search for the "EGFR" string in the 'symbol' column you just made
+
+# Check if "EGFR" is in your new symbol column
+present <- "EGFR" %in% resLFC$symbol
+print(paste("Is EGFR in the results?", present))
+
+# If TRUE, print the results row for EGFR
+if (present) {
+  print("Results for EGFR:")
+  # Use 'which' to get the row(s) safely, ignoring NAs
+  print(resLFC[which(resLFC$symbol == "EGFR"), ])
+}
+```
+                    baseMean log2FoldChange     lfcSE     pvalue       padj     symbol
+
+ENSG00000146648.20    175610      -0.218491 0.0665007 0.00105102 0.00280721       EGFR
+
+## construct a volcano plot to visualize the differential expression results, highlighting the EGFR gene
+```{r}
+# --- 1. Load required libraries ---
+library(ggplot2)
+library(ggrepel)
+
+# --- 2. Prepare the data for plotting ---
+# Convert the DESeq2 results object to a data frame
+res_df <- as.data.frame(resLFC)
+
+# --- 3. Define significance (using 0.05) ---
+res_df$significance <- "Not Significant"
+res_df$significance[res_df$padj < 0.05 & !is.na(res_df$padj)] <- "Significant (FDR < 0.05)"
+res_df$significance[res_df$padj < 0.05 & abs(res_df$log2FoldChange) > 1 & !is.na(res_df$padj)] <- "Significant (FDR & LFC)"
+
+# --- 4. Set the y-axis cap to 25 ---
+y_cap <- 25
+res_df$plot_padj <- -log10(res_df$padj)
+res_df$plot_padj[is.infinite(res_df$plot_padj)] <- y_cap # Cap 'Inf' p-values
+res_df$plot_padj[res_df$plot_padj > y_cap] <- y_cap     # Cap all other high p-values
+
+# --- 5. Create the label for EGFR ---
+res_df$gene_label <- ifelse(res_df$symbol == "EGFR", "EGFR", NA)
+
+# --- 6. Create the plot and save it to a variable ---
+my_volcano_plot <- ggplot(res_df, aes(x = log2FoldChange, y = plot_padj)) +
+  
+  # Draw all points (Red/Blue/Grey)
+  geom_point(aes(color = significance), size = 1) +
+  
+  # Draw a black point on top of EGFR
+  geom_point(data = subset(res_df, symbol == "EGFR"), color = "black", size = 1.5) +
+  
+  # Add the text label for EGFR
+  geom_text_repel(aes(label = gene_label), na.rm = TRUE, box.padding = 0.5) +
+  
+  # Set the colors (with corrected 0.05 labels)
+  scale_color_manual(values = c(
+    "Not Significant" = "grey",
+    "Significant (FDR < 0.05)" = "blue",
+    "Significant (FDR & LFC)" = "red"
+  )) +
+  
+  # Set the titles (with corrected 0.05 subtitle)
+  labs(
+    title = "Volcano Plot: Osimertinib vs. Untreated",
+    subtitle = "GSE278222 (y-axis capped, significance by FDR < 0.05)",
+    x = "log2 Fold Change",
+    y = "-log10 (FDR)"
+  ) +
+  theme_minimal()
+
+# --- 7. Print the plot to your R window/notebook ---
+print(my_volcano_plot)
+
+# --- 8. Save the plot as a square PNG file ---
+ggsave(
+  filename = "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/assessing_mutation_frequency_EGFR_NSCLC/RNA_data_analysis/images/GSE278222_volcano_plot_square.png",
+  plot = my_volcano_plot,
+  width = 8,
+  height = 8,
+  units = "in",
+  dpi = 300
+)
+```
+
+## construct a heatmap to visualize the expression of top 50 differentially expressed genes including EGFR
+
+```{r}
+# --- 1. Install/load required packages ---
+if (!require("pheatmap", quietly = TRUE)) install.packages("pheatmap")
+if (!require("RColorBrewer", quietly = TRUE)) install.packages("RColorBrewer")
+library(pheatmap)
+library(RColorBrewer)
+
+# --- 2. Get normalized expression data ---
+# We use vst() (variance-stabilizing transformation) on the dds object
+# This normalizes the raw counts in a way that's ideal for visualization.
+vst_data <- vst(dds, blind = FALSE)
+vst_matrix <- assay(vst_data)
+
+# --- 3. Get the list of genes to plot ---
+# Get the Ensembl IDs of the top 50 significant genes (ordered by padj)
+top_50_ids <- rownames(resLFC[order(resLFC$padj), ])[1:50]
+
+# Get the Ensembl ID for EGFR (use [1] in case 'which' finds multiple)
+egfr_id <- rownames(resLFC[which(resLFC$symbol == "EGFR"), ])[1]
+
+# Combine them into one list and remove any duplicates
+genes_to_plot_ids <- union(top_50_ids, egfr_id)
+
+# --- 4. Prepare the Heatmap Data Matrix ---
+# Subset the VST matrix to get only the genes we want
+heatmap_data <- vst_matrix[genes_to_plot_ids, ]
+
+# Get the gene symbols for these genes from your results
+heatmap_labels <- resLFC[genes_to_plot_ids, "symbol"]
+
+# If any symbol is NA, use the Ensembl ID instead
+final_labels <- ifelse(is.na(heatmap_labels), genes_to_plot_ids, heatmap_labels)
+rownames(heatmap_data) <- final_labels
+
+# --- 5. Order the Matrix Columns (as you requested) ---
+# Get sample names for each group
+untreated_samples <- sample_info$Sample[sample_info$Group == "Untreated"]
+osimer_samples <- sample_info$Sample[sample_info$Group == "Osimertinib"]
+
+# Create a single vector of the correct sample order
+ordered_sample_names <- c(untreated_samples, osimer_samples)
+
+# Re-order your heatmap data matrix using this vector
+heatmap_data_ordered <- heatmap_data[, ordered_sample_names]
+
+# --- 6. Create the Column Annotation ---
+# pheatmap needs a data frame where rownames match the data's column names
+annotation_col <- data.frame(
+  Group = sample_info$Group,
+  row.names = sample_info$Sample
+)
+
+# --- 7. Create the Heatmap ---
+pheatmap(
+  heatmap_data_ordered,         # <-- Use the new ordered matrix
+  annotation_col = annotation_col,  # Adds the "Untreated"/"Osimertinib" bar
+  scale = "row",                  # CRITICAL: z-scores each gene
+  cluster_cols = FALSE,         # CRITICAL: Keeps your "Untreated" -> "Osi" order
+  cluster_rows = TRUE,            # Groups similar genes
+  
+  main = "Top 50 DEGs + EGFR (GSE278222)",
+  subtitle = "Expression (VST normalized, row-scaled)",
+  
+  # Use a nice Blue-White-Red color palette
+  color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100),
+  
+  # Adjust text size
+  fontsize_row = 8
+)
+```
+

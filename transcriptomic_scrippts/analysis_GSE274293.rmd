@@ -1,0 +1,372 @@
+## get the datat from the supplementary files
+
+```{r}
+library(GEOquery)
+# download the supplementary files and save them in a specific folder
+path_save <- "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/data/RNA/expression_matrices"
+supp_files <- getGEOSuppFiles("GSE274293", baseDir = path_save)
+# check the downloaded files
+list.files(path_save)
+# get the file name
+file_path <- "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/data/RNA/expression_matrices/GSE274293/GSE274293_TPM.tsv.gz"
+# Load the full file, skipping the '#' comment lines
+full_data <- read.delim(
+  file = file_path, 
+  header = TRUE, 
+  comment.char = "#"
+)
+head(full_data)
+```
+
+save file as RDS for future use
+```{r}
+path_1 <- "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/data/RNA/expression_matrices/GSE274293"
+matrix_path <- file.path(path_1, "GSE274293_full_data.rds")
+saveRDS(full_data, file = matrix_path)
+```
+
+## load the RDS file
+```{r}
+matrix_path <- "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/data/RNA/expression_matrices/GSE274293/GSE274293_full_data.rds"
+full_data <- readRDS(file = matrix_path)
+head(full_data)
+dim(full_data)
+```
+
+## preprocessing the data (if needed)
+
+create groups bases on treatment conditions: in this case it is case 1 and 2 in pre and post treatment. 
+the two groups are : "Pre-treatment" and "Post-treatment"
+```{r}
+# create a new data frame with the sample names and their corresponding groups
+sample_info <- data.frame(
+  Sample = colnames(full_data)[-1], # exclude the first column if it contains gene identifiers
+  Group = ifelse(grepl("post", colnames(full_data)[-1]), "post_treatment", "pre_treatment")
+)   
+# check the sample information
+head(sample_info)
+```
+
+create a boxplot to visualize the distribution of expression values across samples
+```{r}
+png("/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/assessing_mutation_frequency_EGFR_NSCLC/RNA_data_analysis/images/boxplot_GSE274293.png", width = 800, height = 600)
+boxplot(full_data[,-1], # exclude the first column if it contains gene identifiers
+        las = 2,
+        main = "Expression values across samples in GSE274293",
+        ylab = "Expression values (TPM)",
+        col = ifelse(sample_info$Group == "Pre-treatment", "lightblue", "lightgreen"))
+dev.off()
+
+```
+
+the boxplot shows the distribution of expression values across the samples. the y axis shows values
+of TPM that go from 0 to 50000. this indicates that the data is not log transformed.
+therefore, a log2 transformation is needed to normalize the data.
+
+log 2 transformation of the data
+```{r}
+# apply log2 transformation to the expression data (excluding the first column if it contains gene identifiers)
+log2_data <- full_data
+log2_data[,-1] <- log2(log2_data[,-1] + 1) # adding 1 to avoid log(0)   
+# check the first few rows of the log2 transformed data
+head(log2_data)
+```
+
+do the boxplot again after log2 transformation
+```{r}
+png("/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/assessing_mutation_frequency_EGFR_NSCLC/RNA_data_analysis/images/boxplot_GSE274293_log2.png", width = 800, height = 600)
+boxplot(log2_data[,-1], # exclude the first column if it contains gene identifiers
+        las = 2,
+        main = "Log2 Transformed Expression values across samples in GSE274293",
+        ylab = "Log2 Expression values (TPM)",
+        col = ifelse(sample_info$Group == "Pre-treatment", "lightblue", "lightgreen"))
+dev.off()
+```
+
+the median expression values are somewhat comparable. as the file from the dataset says TPM, I assume that the data is already normalized.
+
+as the data is already normalized in TPM by the autors and i have log 2 transformed it. it is not possible to use deseq2 or edger as 
+they need raw counts as imput. therefore, i will use limma for the differential expression analysis.
+
+## differential expression analysis using limma
+
+take into account that the data are paired samples (pre and post treatment from the same patient)
+
+For this reason the samples are not independent. 
+```{r}
+library(limma)
+# --- 1. Fix Your Data Format ---
+# (Assuming 'log2_data' has gene IDs in column 1)
+# Store the gene names
+gene_ids <- log2_data[, 1]
+# Create the purely numeric matrix
+log2_matrix <- as.matrix(log2_data[, -1])
+# Set the rownames
+rownames(log2_matrix) <- gene_ids
+# head(log2_matrix)
+
+# --- 2. Create the Correct Paired 'sample_info' ---
+# (Re-create this from your sample names)
+sample_info_2 <- data.frame(
+  row.names = colnames(log2_matrix),
+  Patient = c("Case1", "Case1", "Case2", "Case2"), # Or whatever patient IDs
+  Condition = c("Pre", "Post", "Pre", "Post")
+)
+
+# Set "Pre" as the baseline
+sample_info_2$Condition <- factor(sample_info_2$Condition, levels = c("Pre", "Post"))
+sample_info_2$Patient <- factor(sample_info_2$Patient)
+# head(sample_info_2)
+
+# --- 2.1 NEW: Filter the Matrix ---
+
+# Filter 1: Remove genes with zero variance (This fixes your warning)
+variances <- apply(log2_matrix, 1, var)
+keep1 <- variances > 0
+
+# Filter 2: (Better) Keep genes expressed in at least 2 samples
+# We'll define "expressed" as a log2(TPM+1) value > 1 (i.e., TPM > 1)
+keep2 <- rowSums(log2_matrix > 1) >= 2
+
+# Combine the filters:
+keep_final <- keep1 & keep2
+
+# Create your final, filtered matrix
+filtered_log2_matrix <- log2_matrix[keep_final, ]
+
+print(paste("Original genes:", nrow(log2_matrix)))
+print(paste("Filtered genes:", nrow(filtered_log2_matrix)))
+
+
+# --- 3. Build the Correct Paired Model ---
+# This model finds the 'Condition' effect *after* blocking for each 'Patient'
+design <- model.matrix(~ Patient + Condition, data = sample_info_2)
+
+# --- 4. Run the limma Pipeline ---
+# Fit the linear model
+fit <- lmFit(filtered_log2_matrix, design)
+
+# Apply empirical Bayes moderation
+fit2 <- eBayes(fit)
+
+# Get top genes for the 'ConditionPost' effect
+# This is the "Post vs. Pre" comparison
+top_genes <- topTable(fit2, coef = "ConditionPost", number = Inf, adjust.method = "BH")
+
+# View the (now correct) top differentially expressed genes
+head(top_genes)
+```
+
+now i obtained a list of differentially expressed genes between pre and post treatment samples, taking into account the paired nature of the data.
+I considered the global variance of the genes after filtering out the genes with low variance and low expression across samples. 
+  This is done with the bayes moderation step of limma. And helps to obtain more reliable results, especially with small sample sizes such as in this case. 
+
+## convert the gene identifiers to gene symbols
+
+```{r}
+
+# 1. Install/load the human genome annotation database
+#if (!require("BiocManager", quietly = TRUE))
+#    install.packages("BiocManager")
+# BiocManager::install("org.Hs.eg.db")
+library(org.Hs.eg.db)
+
+# 2. Get the Ensembl IDs from your results (as a character vector)
+ensembl_ids_with_version <- as.character(rownames(top_genes))
+
+# --- 3. NEW STEP: Remove version numbers ---
+# This uses a regular expression to find the literal dot ("\\.") 
+# and any character after it (".*"), and replaces it with nothing ("")
+ensembl_ids_cleaned <- sub("\\..*", "", ensembl_ids_with_version)
+
+# 4. Use mapIds to translate the *cleaned* IDs. 
+gene_symbols_map <- mapIds(org.Hs.eg.db,
+                           keys = ensembl_ids_cleaned, # Use the cleaned IDs
+                           column = "SYMBOL",
+                           keytype = "ENSEMBL",
+                           multiVals = "first")
+
+# 5. Add symbols as a new column
+# This works by looking up each 'cleaned_id' in the 'gene_symbols_map'
+# and assigning the corresponding symbol to the correct row.
+top_genes$symbol <- gene_symbols_map[ensembl_ids_cleaned]
+
+# 6. Check your new, more readable table!
+print(head(top_genes, 40))
+```
+
+
+## now check the presence of EGFR in the results
+```{r}
+# Check if "EGFR" is present, ignoring NA values
+present <- "EGFR" %in% top_genes$symbol
+print(paste("Is EGFR present in the results?", present))
+
+# If present, show the EGFR row
+if (present) {
+  # Use which() to get the row index, this safely ignores NAs
+  egfr_row <- top_genes[which(top_genes$symbol == "EGFR"), ]
+  
+  # A simpler way is to use the subset() function
+  # egfr_row <- subset(top_genes, symbol == "EGFR") 
+  
+  print("Data for EGFR:")
+  print(egfr_row)
+} else {
+  print("EGFR was not found in the significant results table.")
+}
+```
+
+can i print the expression values of EGFR in pre and post treatment samples?
+```{r}
+# 1. Get the Ensembl ID for EGFR (which we know is "ENSG00000146648")
+egfr_id <- "ENSG00000146648"
+
+# 2. Check if this ID is in your filtered matrix rownames
+egfr_present <- egfr_id %in% rownames(filtered_log2_matrix)
+
+print(paste("Is EGFR in the filtered matrix?", egfr_present))
+
+# 3. If it's there, print the expression values
+if (egfr_present) {
+  print("Log2(TPM+1) expression values for EGFR:")
+  
+  # Extract the row from your filtered_log2_matrix
+  egfr_values <- filtered_log2_matrix[egfr_id, ]
+  
+  print(egfr_values)
+}
+```
+from the output i can see that in case 1 the expression of EGFR is stable while in case 2 there is a decrease in expression after the treatment 
+from 5.49 to 2.26 log2(TPM+1).
+
+"Log2(TPM+1) expression values for EGFR:"
+ Case1_pre Case1_post  Case2_pre Case2_post 
+  2.348546   2.381839   5.497086   2.264044 
+
+## construct a heatmap of the top 50 differentially expressed genes and include EGFR
+
+```{r}
+# 1. Install/load the pheatmap package
+if (!require("pheatmap", quietly = TRUE))
+    install.packages("pheatmap")
+library(pheatmap)
+
+# --- MODIFICATIONS START HERE ---
+
+# 2. Get the Ensembl IDs of your top 50 genes
+top_50_ids <- rownames(top_genes)[1:50]
+
+# 2b. Define the Ensembl ID for EGFR (from your previous step)
+egfr_id <- "ENSG00000146648"
+
+# 2c. Create your final list of genes to plot
+# union() adds EGFR and ensures there are no duplicates if it was already in the top 50
+genes_to_plot_ids <- union(top_50_ids, egfr_id)
+
+# --- MODIFICATIONS END HERE ---
+
+
+# 3. Get the expression data *for this new list* from your filtered matrix
+heatmap_data <- filtered_log2_matrix[genes_to_plot_ids, ]
+
+# 4. Get the gene symbols for these genes
+heatmap_labels <- top_genes[genes_to_plot_ids, "symbol"]
+
+# 5. Set the row names of our data to be the symbols
+# (This is a safer way to set labels, in case any symbols are NA)
+final_labels <- ifelse(is.na(heatmap_labels), genes_to_plot_ids, heatmap_labels)
+rownames(heatmap_data) <- final_labels
+
+# 6. Get the sample annotation (from sample_info_2)
+annotation_df <- data.frame(
+  Condition = sample_info_2$Condition,
+  Patient = sample_info_2$Patient,
+  row.names = rownames(sample_info_2)
+)
+
+# 7. Create the heatmap!
+pheatmap(
+  heatmap_data,
+  annotation_col = annotation_df,  # Adds colored bars for Patient/Condition
+  scale = "row",                  # Z-scores each gene (CRITICAL for visualization)
+  cluster_cols = FALSE,           # Don't cluster columns (keeps pre/post together)
+  main = "Top 50 DEGs + EGFR (Post vs. Pre)" # <-- Updated title
+)
+```
+
+
+## construct a volcanoplot (new style) and point out EGFR
+```{r}
+# --- 1. Load required libraries ---
+library(ggplot2)
+library(ggrepel)
+library(dplyr) # For the 'mutate' function
+
+# --- 2. Prepare the data ---
+# Your data is 'top_genes'. We'll use this.
+res_df <- top_genes
+
+# --- 3. THIS IS THE KEY: Create the "class" column ---
+# We define the thresholds from your example code
+lfc_threshold <- 1.5
+pval_threshold <- 0.05
+
+res_df <- res_df %>%
+  mutate(
+    # Create the 'class' column based on logFC and P.Value
+    class = case_when(
+      logFC > lfc_threshold & P.Value < pval_threshold ~ "+",
+      logFC < -lfc_threshold & P.Value < pval_threshold ~ "-",
+      TRUE ~ "="
+    ),
+    # Make 'class' a factor to control the order in the legend
+    class = factor(class, levels = c("+", "-", "="))
+  )
+
+# --- 4. Create the label for EGFR ---
+res_df$gene_label <- ifelse(res_df$symbol == "EGFR", "EGFR", NA)
+
+# --- 5. Create the plot (using the "king" style) ---
+my_volcano_plot_gse274293 <- ggplot(res_df, aes(x = logFC, y = -log10(P.Value))) +
+  
+  # Draw all points, colored by our new 'class' column
+  geom_point(aes(color = class), alpha = 0.7) +
+  
+  # Add the text label for EGFR (it will be black by default)
+  geom_text_repel(aes(label = gene_label), na.rm = TRUE, box.padding = 0.5) +
+  
+  # Apply the colors from your example code
+  scale_color_manual(values = c("=" = "grey70", "+" = "firebrick3", "-" = "blue3")) +
+  
+  # Add the dashed threshold lines
+  geom_vline(xintercept = c(-lfc_threshold, lfc_threshold), linetype = "dashed", color = "grey20") +
+  geom_hline(yintercept = -log10(pval_threshold), linetype = "dashed", color = "grey20") +
+  
+  # Add the theme
+  theme_bw() +
+  
+  # Add labs
+  labs(
+    title = "Volcano Plot: Post vs. Pre-Treatment (GSE274293)",
+    subtitle = "Significance: Uncorrected P-value < 0.05 and |logFC| > 1.5",
+    x = "log2 Fold Change",
+    y = "-log10 (Uncorrected p-value)",
+    color = "Significance" # Adds a title to the legend
+  )
+
+# --- 6. Print the plot ---
+print(my_volcano_plot_gse274293)
+
+# --- 7. Save the plot as a square PNG file ---
+ggsave(
+  filename = "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/assessing_mutation_frequency_EGFR_NSCLC/RNA_data_analysis/images/GSE274293_volcano_plot_styled.png",
+  plot = my_volcano_plot_gse274293,
+  width = 8,
+  height = 8,
+  units = "in",
+  dpi = 300
+)
+```
+
+
