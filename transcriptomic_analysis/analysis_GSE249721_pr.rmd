@@ -1,0 +1,440 @@
+
+
+## load data from GEO database - GSE249721
+
+```{r}
+library(GEOquery)
+library(org.Hs.eg.db)
+```
+
+## get the datat from the supplementary files
+```{r}
+# download the supplementary files and save them in a specific folder
+path_save <- "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/data/RNA/expression_matrices"
+supp_files <- getGEOSuppFiles("GSE249721", baseDir = path_save)
+# check the downloaded files
+list.files(path_save)
+# get the file name
+file_path <- rownames(supp_files)[1]
+# Load the full file, skipping the '#' comment lines
+full_data <- read.delim(
+  file = file_path, 
+  header = TRUE, 
+  comment.char = "#"
+)
+head(full_data)
+```
+
+save data frame as RDS file for future use
+```{r}
+path_1 <- "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/data/RNA/expression_matrices/GSE249721"
+matrix_path <- file.path(path_1, "GSE249721_full_data.rds")
+saveRDS(full_data, file = matrix_path)
+```
+
+load the RDS file
+```{r}
+matrix_path <- "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/data/RNA/expression_matrices/GSE249721/GSE249721_full_data.rds"
+full_data <- readRDS(file = matrix_path)
+head(full_data) 
+dim(full_data)  
+```
+
+### extract the expression matrix of the HCC827 cell line
+```{r}
+# subset the data for HCC827 samples
+hcc827_data <- full_data[, grepl("HCC827", colnames(full_data))]
+# check the dimensions of the subsetted data
+dim(hcc827_data)
+print(hcc827_data[1:6, 1:6])
+```
+
+## preprocessing the data
+
+create groups based on treatment conditions
+the two groups are: "Osimertinib" and "Untreated"
+```{r}
+# create a new data frame with the sample names and their corresponding groups
+sample_info <- data.frame(
+  Sample = colnames(hcc827_data),
+  Group = ifelse(grepl("Osimertinib", colnames(hcc827_data)), "Osimertinib", "Untreated")
+)
+
+# --- CHUNK 1: Prepare Sample Information ---
+
+# 1. Create a "Replicate" column
+# This counts 1, 2, 3... for each group automatically
+sample_info$Replicate <- ave(as.character(sample_info$Group), 
+                             sample_info$Group, 
+                             FUN = seq_along)
+
+# 2. Create a clean ID (e.g., "Untreated_1", "Osimertinib_1")
+sample_info$Clean_ID <- paste0(sample_info$Group, "_", sample_info$Replicate)
+
+# 3. Set these clean IDs as the row names
+# This is critical for pheatmap to match rows to columns later
+rownames(sample_info) <- sample_info$Sample
+
+# Check the result
+print(sample_info)
+```
+
+ create a box plot to visualize the distribution of expression values across samples, include the two groups with different colors
+save image file here: laboratory_bio_datamining/assessing_mutation_frequency_EGFR_NSCLC/RNA_data_analysis/images
+
+```{r}
+png(filename = "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/assessing_mutation_frequency_EGFR_NSCLC/RNA_data_analysis/images/hcc827_expression_boxplot_GSE249721.png", width = 800, height = 600) 
+boxplot(hcc827_data, 
+        main = "Boxplot of HCC827 Expression Data",
+        xlab = "Samples",
+        ylab = "Expression Values",
+        las = 2, # rotate x-axis labels for better readability
+        col = ifelse(sample_info$Group == "Osimertinib", "lightblue", "lightgreen"))
+        legend("topright", legend = c("Osimertinib", "Untreated"), fill = c("lightblue", "lightgreen"))
+dev.off()
+
+```
+
+as the expression values are between 0 and 15 we can asume the data has been alread log2 transformed 
+
+## now we can proceed to differential expression analysis using limma package
+```{r}
+library(limma)
+
+# --- NEW FILTERING STEP ---
+# 1. Calculate the variance for every gene (row)
+gene_variances <- apply(hcc827_data, 1, var)
+
+# 2. Keep only genes that have a variance greater than 0
+# (You could even use a higher threshold, like 0.1, to be stricter)
+keep <- gene_variances > 0
+filtered_data <- hcc827_data[keep, ]
+
+# 3. See how many genes we kept
+print(paste("Original genes:", nrow(hcc827_data)))
+print(paste("Filtered genes:", nrow(filtered_data)))
+# --- END OF FILTERING ---
+
+
+# 4. Create the design matrix (same as before)
+design <- model.matrix(~ 0 + Group, data = sample_info)
+colnames(design) <- c("Osimertinib", "Untreated")
+contrast.matrix <- makeContrasts(Osimertinib - Untreated, levels = design)
+
+# 5. Fit the model *on the filtered data*
+fit <- lmFit(filtered_data, design) # <-- Use filtered_data
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+
+# 6. Get the results (which should now be much more reasonable)
+top_genes <- topTable(fit2, n = Inf)
+
+# 7. Check the new, more realistic results
+print(head(top_genes))
+```
+
+now we can proceed to translated the gene ids to gene symbols. we are proably dealing with Entrez IDs, but we need to check this first.
+```{r}
+
+# 8. NOW, look for your gene
+# (Replace "THE_REAL_GENE_NAME" with what you found in the grep step)
+# "THE_REAL_GENE_NAME" %in% rownames(top_genes)
+# check the gene names
+print(rownames(top_genes)[1:20])
+# the gene names are numbers of 4 digits
+# ------------------------------
+# ------------------------------
+
+
+
+# 1. Get the Entrez IDs from your results
+entrez_ids <- rownames(top_genes)
+
+# 2. Use the 'mapIds' function to translate them
+# We are telling it: "Here are Entrez IDs, please give me the SYMBOLs"
+gene_symbols <- mapIds(org.Hs.eg.db,
+                       keys = entrez_ids,
+                       column = "SYMBOL",
+                       keytype = "ENTREZID",
+                       multiVals = "first")
+
+# filter the results for NA values
+gene_simbol_wona <- gene_symbols[!is.na(gene_symbols)]
+# check how many NAs we have
+print(paste("Number of NA gene symbols:", sum(is.na(gene_symbols))))
+# cehck how many gene symbols we have
+print(paste("Number of gene symbols:", length(gene_symbols)))
+
+
+
+# 3. Add these new symbols as a column to your results
+top_genes$symbol <- gene_symbols
+
+# ALTERNATIVE
+
+# 2. Get the Entrez IDs from your results (e.g., "20799", "10502")
+entrez_ids <- as.character(rownames(top_genes))
+
+# 3. Use mapIds and specify keytype = "ENTREZID"
+gene_symbol_2 <- mapIds(org.Hs.eg.db,
+                       keys = entrez_ids,
+                       column = "SYMBOL",
+                       keytype = "ENTREZID", # <-- This is the correct keytype
+                       multiVals = "first")
+
+# 4. Add these symbols as a new column to your results table
+top_genes$symbol_2 <- gene_symbol_2
+
+# 5. Check your new, more readable table!
+print(head(top_genes, 10))
+
+# CHECK if the tow symbol columns are identical
+all(top_genes$symbol == top_genes$symbol_2, na.rm = TRUE)
+```
+
+
+focus on finding the id for EGFR gene and its expression results
+
+```{r}
+library(org.Hs.eg.db)
+
+egfr_id <- mapIds(org.Hs.eg.db,
+                  keys = "EGFR",
+                  column = "ENTREZID",
+                  keytype = "SYMBOL")
+
+print(egfr_id)
+str(egfr_id) # should be a character vector of length 1
+# check if EGFR is in the results
+"1956" %in% rownames(top_genes) # -> TRUE
+# extract the EGFR row
+egfr_results <- top_genes["1956", ]
+print(egfr_results)
+# print 1956 row with gene symbol
+egfr_results_with_symbol <- top_genes[rownames(top_genes) == "1956", ]
+print(egfr_results_with_symbol)
+```
+EGFR differential expression results:
+          logFC  AveExpr         t     P.Value   adj.P.Val         B symbol
+  1956 -1.143036 10.40191 -7.398521 0.000250821 0.001646928 0.7437499   EGFR
+
+
+## construct a volcano plot to visualize the differential expression results, highlighting the EGFR gene
+```{r}
+
+```
+
+
+## construct a heatmap to visualize the expression of the top 50 differentially expressed genes, including EGFR
+
+```{r}
+library(pheatmap)
+library(RColorBrewer)
+library(dplyr)
+library(tibble)
+# select the top 30 differentially expressed genes
+top_30_ids <- rownames(top_genes)[1:30]
+# also include EGFR if not already in the top 30
+if (!"1956" %in% top_30_ids) {
+  top_30_ids <- c(top_30_ids, "1956")
+}
+# subset the filtered data for these top genes
+heatmap_data <- filtered_data[top_30_ids, ]
+# get the gene symbols for row names
+gene_symbols_heatmap <- top_genes[top_30_ids, "symbol"]
+
+# set the row names of our data to be the gene symbols
+final_labels_heatmap <- ifelse(is.na(gene_symbols_heatmap), top_30_ids, gene_symbols_heatmap)
+rownames(heatmap_data) <- final_labels_heatmap
+
+# --- 3. THIS IS THE FIX: Order the Columns ---
+# Get the sample names in the order you want
+untreated_samples <- sample_info$Sample[sample_info$Group == "Untreated"]
+osimer_samples <- sample_info$Sample[sample_info$Group == "Osimertinib"]
+
+# Create a single vector of the correct sample order
+ordered_sample_names <- c(untreated_samples, osimer_samples)
+
+# Re-order your heatmap data matrix using this vector
+heatmap_data_ordered <- heatmap_data[, ordered_sample_names]
+
+# --- 4. Get your annotation dataframe ---
+# (This code is the same as before)
+annotation_col <- data.frame(
+  Group = sample_info$Group,
+  row.names = sample_info$Sample
+)
+
+# --- 5. Create the heatmap ---
+pheatmap(
+  heatmap_data_ordered,         
+  annotation_col = annotation_col,
+  scale = "row",
+  cluster_cols = TRUE,         
+  show_colnames = FALSE,        # <-- THIS hides the text labels at the bottom
+  main = "Top 30 DEGs + EGFR (Untreated vs. Osimertinib)",
+  
+  # Optional: Improve colors
+  color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100)
+)
+```
+
+```{r}
+# --- 1. Load Libraries ---
+library(pheatmap)
+library(RColorBrewer)
+
+# --- 2. Prepare Data (Same as before) ---
+top_genes_sorted <- top_genes[order(top_genes$adj.P.Val), ]
+top_30_ids <- rownames(top_genes_sorted)[1:20]
+if (!"1956" %in% top_30_ids) top_30_ids <- c(top_30_ids, "1956")
+
+heatmap_data <- filtered_data[top_30_ids, ]
+gene_symbols <- top_genes[top_30_ids, "symbol"]
+final_labels <- ifelse(is.na(gene_symbols), top_30_ids, gene_symbols)
+rownames(heatmap_data) <- final_labels
+
+# --- 3. Prepare Annotation (THE FIX) ---
+untreated_samples <- sample_info$Sample[sample_info$Group == "Untreated"]
+osimer_samples <- sample_info$Sample[sample_info$Group == "Osimertinib"]
+ordered_cols <- c(untreated_samples, osimer_samples)
+heatmap_data <- heatmap_data[, ordered_cols]
+
+# THIS IS THE FIX: Add 'Replicate' to the annotation data frame
+# Now you will have TWO columns in this data frame, which creates TWO bars on the plot
+annotation_col <- data.frame(
+  Group = sample_info[ordered_cols, "Group"],
+  Replicate = as.factor(sample_info[ordered_cols, "Replicate"]), # <--- Added this
+  row.names = ordered_cols
+)
+
+# --- 4. Define Colors for BOTH Bars ---
+ann_colors <- list(
+  # Colors for the first bar (Group)
+  Group = c(Untreated = "grey70", Osimertinib = "firebrick3"),
+  
+  # Colors for the second bar (Replicate)
+  # I used light distinct colors, but you can change these
+  Replicate = c("1" = "#A6CEE3", "2" = "#1F78B4", "3" = "#B2DF8A")
+)
+
+# --- 5. Draw Heatmap ---
+# Define scale breaks to fix the "wash out" issue
+break_list <- seq(-2, 2, length.out = 101)
+
+pheatmap(
+  heatmap_data,
+  
+  # Annotations
+  annotation_col = annotation_col, # Now contains both Group and Replicate
+  annotation_colors = ann_colors,  # Contains colors for both
+  
+  # Visual Settings
+  scale = "row",
+  color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100),
+  breaks = break_list,
+  
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  
+  show_colnames = FALSE, # Still hidden, but now you have the Replicate bar!
+  show_rownames = TRUE,
+  gaps_col = length(untreated_samples),
+  
+  fontsize_row = 9,
+  main = "Top 30 DEGs + EGFR (GSE249721)"
+)
+
+```
+
+
+
+## volcano plot
+
+## construct a volcano plot to visualize the differential expression results, highlighting the EGFR gene
+```{r}
+# --- 1. Load required libraries ---
+library(ggplot2)
+library(ggrepel)
+
+# --- 2. Prepare the data for plotting ---
+# Your data is 'top_genes', which is already a data frame.
+res_df <- top_genes
+
+# --- 3. Define significance (using FDR < 0.05) ---
+# We use the column names from your 'top_genes' table: 'adj.P.Val' and 'logFC'
+res_df$significance <- "Not Significant"
+res_df$significance[res_df$adj.P.Val < 0.05 & !is.na(res_df$adj.P.Val)] <- "Significant (FDR < 0.05)"
+res_df$significance[res_df$adj.P.Val < 0.05 & abs(res_df$logFC) > 1 & !is.na(res_df$adj.P.Val)] <- "Significant (FDR & LFC)"
+
+# --- 4. Create Y-axis variable ---
+# We use 'adj.P.Val'. (Note: No y-axis cap is needed, as these p-values are not Inf)
+res_df$plot_padj <- -log10(res_df$adj.P.Val)
+
+# --- 5. Create the label for EGFR ---
+# This uses the 'symbol' column you created
+res_df$gene_label <- ifelse(res_df$symbol == "EGFR", "EGFR", NA)
+
+# --- 6. Create the plot and save it to a variable ---
+my_volcano_plot_gse249721 <- ggplot(res_df, aes(x = logFC, y = plot_padj)) +
+  
+  # Draw all points (Red/Blue/Grey)
+  geom_point(aes(color = significance), size = 1) +
+  
+  # Draw a black point on top of EGFR
+  geom_point(data = subset(res_df, symbol == "EGFR"), color = "black", size = 1.5) +
+  
+  # Add the text label for EGFR
+  geom_text_repel(aes(label = gene_label), na.rm = TRUE, box.padding = 0.5) +
+  
+  # Set the colors
+  scale_color_manual(values = c(
+    "Not Significant" = "grey",
+    "Significant (FDR < 0.05)" = "blue",
+    "Significant (FDR & LFC)" = "red"
+  )) +
+  
+  # Set the titles
+  labs(
+    title = "Volcano Plot: Osimertinib vs. Untreated (GSE249721)",
+    subtitle = "limma analysis (significance by FDR < 0.05)",
+    x = "log2 Fold Change",
+    y = "-log10 (FDR)"
+  ) +
+  theme_minimal()
+
+# --- 7. Print the plot to your R window/notebook ---
+print(my_volcano_plot_gse249721)
+
+# --- 8. Save the plot as a square PNG file ---
+# (I've used a file path based on your other script)
+path_save_1000 <- "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/assessing_mutation_frequency_EGFR_NSCLC/RNA_data_analysis/images"
+ggsave(
+  filename = "volcano_plot_GSE249721.png",
+  plot = my_volcano_plot_gse249721,
+  width = 8,
+  height = 8,
+  units = "in",
+  dpi = 300
+)
+```
+
+# export the dataframe filtered for the top 1000 differentially expressed genes including EGFR to a TSV file
+```{r}
+save_path_721 <- "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/assessing_mutation_frequency_EGFR_NSCLC/top_common_genes"
+
+# ensure directory exists
+dir.create(save_path_721, recursive = TRUE, showWarnings = FALSE)
+
+# export the entire top_genes table to TSV
+out_file <- file.path(save_path_721, "GSE249721_DE_results_with_symbols.tsv")
+write.table(top_genes,
+      file = out_file,
+      sep = "\t",
+      quote = FALSE,
+      row.names = TRUE,
+      col.names = NA)
+```
+
+
+

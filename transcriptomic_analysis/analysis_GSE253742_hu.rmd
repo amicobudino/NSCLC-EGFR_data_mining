@@ -1,0 +1,272 @@
+
+## Reproduced analysis for GSE253742
+
+```{r}
+
+library(GEOquery)
+library(utils)
+
+path_save <- "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/data/RNA/expression_matrices"
+```
+
+```{r}
+dir.create(path_save, recursive = TRUE, showWarnings = FALSE)
+supp_files <- getGEOSuppFiles("GSE253742", baseDir = path_save)
+print(supp_files)
+
+# List files we now have in the GSE253742 folder
+list.files(file.path(path_save, "GSE253742"))
+```
+
+```{r}
+# --- 2. Identify the expression matrix file ---
+# Set `file_path` to the actual expression matrix filename you downloaded. If there
+# are multiple files, pick the file that contains expression per-gene across samples.
+# Example (update if different):
+file_path <- file.path(path_save, "GSE253742", "GSE253742_FPKManno.txt.gz")
+
+# If you don't know the exact name, run the list.files(...) line above and copy the path.
+# stopifnot(file.exists(file_path))
+
+# --- 3. Read the file (robust to comment lines) ---
+full_data <- read.delim(file = file_path, header = TRUE, comment.char = "#", stringsAsFactors = FALSE)
+head(full_data)
+dim(full_data)
+
+# Quick summary of the numeric values to help decide whether data are counts/TPM/RPKM
+numeric_cols <- sapply(full_data, is.numeric)
+if (any(numeric_cols)) {
+	numeric_summary <- summary(as.matrix(full_data[, numeric_cols]))
+	print(numeric_summary)
+	# check whether values look integer-like
+	vals <- as.numeric(unlist(full_data[, numeric_cols]))
+	integer_like <- all(abs(vals - round(vals)) < 1e-6, na.rm = TRUE)
+	cat("Integer-like values across numeric columns?", integer_like, "\n")
+	cat("Max value:", max(vals, na.rm = TRUE), "\n")
+}
+
+# --- 4. Save as RDS for faster future loading ---
+matrix_path <- file.path(path_save, "GSE253742_full_data.rds")
+saveRDS(full_data, file = matrix_path)
+```
+```{r}
+# --- 5. Load from RDS (example) ---
+matrix_path <- file.path(path_save, "GSE253742_full_data.rds")
+full_data <- readRDS(matrix_path)
+head(full_data)
+```
+
+```{r}
+# ---------------------------------------------------------------
+# NOTE FOR YOU: please confirm the expression unit and sample groups
+# - Is the expression given as raw counts, TPM, or RPKM/FPKM?
+#   Set the variable `expression_type` below accordingly ("counts" or "TPM" or "RPKM").
+# - Provide the sample pairing / patient IDs and pre/post or condition labels.
+#   Fill `sample_info_manual` below with your sample names, Patient IDs and Condition.
+# ---------------------------------------------------------------
+
+# Example: set this to one of "counts", "TPM", or "RPKM". Update as needed.
+expression_type <- "FPKM" # <-- CHANGE if needed
+
+# -------------- Preprocessing & sample info --------------
+# The sample groups are the following: 
+# Naive: N1 N2 N3 N4
+# Resistant: R1 R2 R3 R4
+
+# Provide sample info here: replace the example below with your actual sample names/order.
+# Example format: a data.frame with rownames matching `colnames(expr_matrix_raw)`
+# and columns `Patient` and `Condition` (Condition should be factor with baseline first).
+sample_info_manual <- data.frame(
+    row.names = colnames(full_data)[-1], # assuming first column is gene IDs
+    Patient = c("P1", "P2", "P3", "P4", "P1", "P2", "P3", "P4"), # example patient IDs
+    Condition = c("Naive", "Naive", "Naive", "Naive", "Resistant", "Resistant", "Resistant", "Resistant") # example conditions
+)
+
+print("Please edit `sample_info_manual` in this script to reflect your samples.")
+head(sample_info_manual)
+
+# Quick boxplot to inspect distributions across samples
+png("/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/assessing_mutation_frequency_EGFR_NSCLC/RNA_data_analysis/images/boxplot_GSE253742.png", width = 1000, height = 600)
+boxplot(full_data[,-1], las = 2, main = "Expression values across samples (raw)", ylab = "Expression")
+dev.off()
+
+# data is not log-transformed (large range), do a log2 transform for visualization/limma
+expr_matrix_log2 <- log2(full_data[,-1] + 1)
+head(expr_matrix_log2)
+dim(expr_matrix_log2)
+# add back rownames
+rownames(expr_matrix_log2) <- full_data[,1]
+dim(expr_matrix_log2)
+head(expr_matrix_log2)
+
+png("/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/assessing_mutation_frequency_EGFR_NSCLC/RNA_data_analysis/images/boxplot_GSE253742_log2.png", width = 1000, height = 600)
+boxplot(expr_matrix_log2, las = 2, main = "Log2(Expression+1) across samples", ylab = "Log2(Expression+1)")
+dev.off()
+
+```
+
+```{r}
+# ---------------- Differential expression ----------------
+# Using limma for log-transformed data (TPM/RPKM)
+library(limma)
+
+# Convert log2 matrix to numeric matrix used by limma
+log2_matrix <- as.matrix(expr_matrix_log2)
+
+# You must fill sample_info_manual with Patient and Condition values.
+sample_info <- sample_info_manual
+stopifnot(!any(is.na(sample_info$Patient)), !any(is.na(sample_info$Condition)))
+
+# Ensure factors and baseline
+sample_info$Condition <- factor(sample_info$Condition, levels = unique(sample_info$Condition))
+sample_info$Patient <- factor(sample_info$Patient)
+
+# Filter genes: remove zero-variance and lowly-expressed
+variances <- apply(log2_matrix, 1, var)
+keep1 <- variances > 0
+keep2 <- rowSums(log2_matrix > 1) >= 2
+keep_final <- keep1 & keep2
+filtered_log2_matrix <- log2_matrix[keep_final, ]
+
+cat("Original genes:", nrow(log2_matrix), "\n")
+cat("Filtered genes:", nrow(filtered_log2_matrix), "\n")
+
+# Build design: paired analysis controlling for Patient
+design <- model.matrix(~ Patient + Condition, data = sample_info)
+
+fit <- lmFit(filtered_log2_matrix, design)
+fit2 <- eBayes(fit)
+
+# The coefficient name depends on the factor levels; inspect colnames(design)
+print(colnames(design))
+# Example: if your condition factor is Baseline="Pre", contrast will be ConditionPost
+coef_name <- grep("Condition", colnames(design), value = TRUE)[1]
+top_genes <- topTable(fit2, coef = coef_name, number = Inf, adjust.method = "BH")
+head(top_genes)
+```
+
+```{r}
+
+
+# ---------------- Check EGFR expression ----------------
+# checking for EGFR expression
+egfr_expression <- filtered_log2_matrix["EGFR", ]
+print("EGFR expression across samples (log2 scale):")
+print(egfr_expression)
+
+# check how many times is EGFR present in the ID column
+# --- THIS IS THE CORRECTED LINE ---
+egfr_count <- sum(rownames(filtered_log2_matrix) == "EGFR", na.rm = TRUE)
+# --- END CORRECTION ---
+
+cat("Number of times EGFR is present in the gene IDs:", egfr_count, "\n")
+
+```
+
+```{r}
+# construct the heatmap of the top 30 genes
+library(pheatmap)
+top_30_genes_ID <- top_genes$ID[1:30]
+# include EGFR if not already in top 30
+if (!"EGFR" %in% rownames(filtered_log2_matrix[top_30_genes_ID, ])) {
+    top_30_genes_ID <- c(top_30_genes_ID, "EGFR")
+}
+# subset the expression matrix for these genes
+heatmap_matrix <- filtered_log2_matrix[top_30_genes_ID, ]
+#tail(heatmap_matrix)
+
+# create annotation for columns
+annotation_col <- data.frame(
+    Condition = sample_info$Condition,
+    Patient = sample_info$Patient
+)
+rownames(annotation_col) <- rownames(sample_info)
+#head(annotation_col)
+
+# plot heatmap
+pheatmap(heatmap_matrix,
+         annotation_col = annotation_col,
+         scale = "row",
+         clustering_distance_rows = "correlation",
+         clustering_distance_cols = "correlation",
+         main = "Top 30 Differentially Expressed Genes + EGFR",
+         filename = "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/assessing_mutation_frequency_EGFR_NSCLC/RNA_data_analysis/images/GSE253742_top30_heatmap.png",
+         width = 8, height = 10)
+
+```
+
+```{r}
+# ---------------- Volcano plot (styled) ----------------
+if (exists("top_genes")) {
+    library(ggplot2)
+    library(ggrepel)
+    library(dplyr)
+
+    # --- 1. Prepare the data ---
+    res_df <- top_genes
+    lfc_threshold <- 1.5
+    pval_threshold <- 0.05 # Using P.Value is good for less-powered studies
+
+    res_df <- res_df %>% mutate(
+        # Create the 'class' column based on logFC and P.Value
+        class = case_when(
+            logFC > lfc_threshold & P.Value < pval_threshold ~ "+",
+            logFC < -lfc_threshold & P.Value < pval_threshold ~ "-",
+            TRUE ~ "="
+        ),
+        class = factor(class, levels = c("+", "-", "=")),
+        
+        # --- THIS IS THE CORRECTION ---
+        # Gene symbols are in the 'ID' column, not 'symbol'
+        gene_label = ifelse(ID == "EGFR", "EGFR", NA)
+        # --- END CORRECTION ---
+    )
+
+    # --- 2. Create the plot ---
+    my_volcano <- ggplot(res_df, aes(x = logFC, y = -log10(P.Value))) +
+        
+        # Add all points, colored by class
+        geom_point(aes(color = class), alpha = 0.7) +
+        
+        # Add the text label for EGFR
+        geom_text_repel(aes(label = gene_label), 
+                        na.rm = TRUE, 
+                        color = "black", 
+                        box.padding = 0.5) +
+        
+        # Set colors
+        scale_color_manual(values = c("=" = "grey70", "+" = "firebrick3", "-" = "blue3")) +
+        
+        # Add dashed threshold lines
+        geom_vline(xintercept = c(-lfc_threshold, lfc_threshold), linetype = "dashed", color = "grey20") +
+        geom_hline(yintercept = -log10(pval_threshold), linetype = "dashed", color = "grey20") +
+        
+        # Set theme and labels
+        theme_bw() + 
+        labs(
+          title = "Volcano Plot: Resistant vs. Naive (GSE253742)", 
+          subtitle = paste("Significance: Uncorrected P-value <", pval_threshold, "and |logFC| >", lfc_threshold),
+          x = "log2 Fold Change", 
+          y = "-log10 (Uncorrected P-value)",
+          color = "Significance"
+        )
+
+    # --- 3. Print and save the plot ---
+    print(my_volcano)
+    
+    ggsave(filename = "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/assessing_mutation_frequency_EGFR_NSCLC/RNA_data_analysis/images/GSE253742_volcano_plot.png", 
+           plot = my_volcano, 
+           width = 8, 
+           height = 8, 
+           dpi = 300)
+}
+```
+
+## save the results as a tsv file for meta analysis
+```{r}
+out_path_742 <- "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/assessing_mutation_frequency_EGFR_NSCLC/top_common_genes"
+# write to file the top genes object as a tsv file
+write.table(as.data.frame(top_genes), file = file.path(out_path_742, "GSE253742_DE_results_with_symbols.tsv"), sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+

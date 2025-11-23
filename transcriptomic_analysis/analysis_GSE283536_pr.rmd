@@ -1,0 +1,342 @@
+
+## install libraries 
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("GEOquery")
+library(GEOquery)
+
+```
+
+## load data from GEOquery
+dataset: GSE283536
+```{r}
+data_GEO <- getGEO("GSE283536", GSEMatrix = TRUE)
+expression_data <- exprs(data_GEO[[1]])
+# check the dimensions of the expression matrix
+dim(expression_data)
+print(expression_data[0:10, 0:4])
+# get metadata
+# Extract the sample metadata table
+sample_info <- pData(data_GEO[[1]])
+
+# Print the first few columns to see what's inside
+# (It has 38 columns, so we just look at the first 6)
+print(head(sample_info[, 1:6]))
+# Extract and print specific metadata information
+sample_info_titles <- sample_info$title
+print(sample_info_titles)
+# extract at the same time the geo_accession and title columns
+sample_metadata <- sample_info[, c("geo_accession", "title")]
+print(head(sample_metadata))
+
+```
+
+now that i have a map form the geoa ccessio to the title i can use it to create sample labels for the data. 
+
+```{r}
+# check the expression data column names
+colnames(expression_data)
+
+# substitute the colnames from the geo_accesison to the title 
+print(expression_data[0:5, 0:4])
+
+# Create a named vector to map geo_accession to title
+accession_to_title <- setNames(sample_metadata$title, sample_metadata$geo_accession)
+# add a row with the titles as colnames
+colnames(expression_data) <- accession_to_title[colnames(expression_data)]
+#check the updated column names
+colnames(expression_data)
+# cehch the head of the expression data with new colnames
+print(expression_data[0:5, 0:4])
+```
+
+now in the column names of the expression matrix i have the titles of the samples instead of the geo_accession.
+
+here i want to dave the expression matrix as a csv file for further analysis.
+```{r}
+# save the expression data as a rds file
+save_rds_path <- "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/data/RNA/GSE283536/expression_data_GSE283536.rds"
+saveRDS(expression_data, file = save_rds_path)
+```
+now load the rds file to check that it was saved correctly
+```{r}
+# load the expression data from the rds file
+loaded_expression_data <- readRDS(save_rds_path)
+# check the dimensions of the loaded expression matrix
+dim(loaded_expression_data)
+```
+
+## create sample groups based on the titles
+the two groups are Osimertinib and Control. 
+If "CTL" is present in the title then it is a control sample, otherwise it is an Osimertinib sample.
+
+```{r}
+# create a data frame with sample names and their corresponding groups
+sample_groups <- data.frame(
+    sample_name = colnames(loaded_expression_data),
+    group = ifelse(grepl("CTL", colnames(loaded_expression_data)), "Control", "Osimertinib")
+)
+# print the sample groups
+print(sample_groups)
+```
+
+## check the distribution of gen expression in samples in each group
+createa. boxplot ro vosualize distribution across samples. 
+include the two gorups with different colors. 
+save images at the specified path. 
+```{r}
+# load ggplot2 for visualization
+library(ggplot2)
+library(reshape2)
+# path to save file
+save_box_path <- "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/assessing_mutation_frequency_EGFR_NSCLC/RNA_data_analysis/images"
+# create the image
+png(filename = file.path(save_box_path, "expression_boxplot_GSE283536.png"), width = 1200, height = 800)
+# create boxplot
+boxplot(loaded_expression_data,
+        main = "Gene Expression Distribution Across Samples (GSE283536)",
+        xlab = "Samples",
+        ylab = "Expression Levels",
+        las = 2,
+        col = ifelse(sample_groups$group == "Control", "lightblue", "lightgreen")
+        )
+dev.off()
+
+# additionally chech the distribution of the expression values
+summary(loaded_expression_data)
+
+# --- 1. Apply log2 transformation ---
+# We add 1 to avoid log2(0)
+log2_data <- log2(loaded_expression_data + 1)
+
+# --- 2. Check the data again ---
+# This summary will now look "normal" (e.g., max ~ 10-12)
+print(summary(log2_data))
+
+# --- 3. Create a boxplot to visualize the normalized data ---
+boxplot(log2_data, 
+        main = "Boxplot of Log2-Transformed Data (GSE283536)",
+        ylab = "Log2 Expression",
+        las = 2) # las=2 rotates sample names for readability
+```
+
+values range between 0 and 1500 approximately. This means that i need to log transform the data for further analysis.
+already log 2 transformed in the code block above. 
+
+now procede with limma to do differential expression analysis between the two groups.
+
+```{r}
+# load limma library
+library(limma)
+# compute the variance for each gene across all samples
+gene_variances <- apply(log2_data, 1, var)
+# keep only genes that have variance greater than 0
+keep_genes <- gene_variances > 0
+filtered_data <- log2_data[keep_genes, ]
+
+# see hom many genes were kept
+print(paste("Number of genes kept after filtering:", nrow(filtered_data)))
+print(paste("Number of genes removed after filtering:", nrow(log2_data) - nrow(filtered_data)))
+
+# create design matrix for the two groups
+design_m <- model.matrix(~ 0 + factor(sample_groups$group))
+colnames(design_m) <- c("Control", "Osimertinib")
+contrast.matrix <- makeContrasts(Osimertinib - Control, levels = design_m)
+
+# fit the linear model
+fit <- lmFit(filtered_data, design_m)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+
+# get the differentially expressed genes
+top_genes <- topTable(fit2, adjust.method = "BH", number = Inf)
+# view the top differentially expressed genes
+head(top_genes)
+```
+
+## now translate the gene ids into gene symbols
+
+```{r}
+# load the org.Hs.eg.db library for gene annotation
+BiocManager::install("org.Hs.eg.db")
+library(org.Hs.eg.db)
+```
+
+```{r}
+# check the gnee names in the top_genes data frame
+head(rownames(top_genes))
+
+# extract tje featured data (anotaion table) from my geo object
+feature_data <- fData(data_GEO[[1]])
+# check the first few rows of the feature data
+head(feature_data)
+print(colnames(feature_data))
+```
+here i'm able to identify the column GENE_SYMBOL 
+               LOCUSLINK_ID  GENE_SYMBOL
+A_19_P00315452    100130938 LOC100130938
+A_19_P00315502    102723721 LOC102723721
+A_19_P00315506         9674     KIAA0040
+A_19_P00315551       400043    LOC400043
+A_19_P00315581       400955    LINC01122
+A_19_P00315584    100130691 LOC100130691
+
+```{r}
+# add the gene symbols to the top_genes data frame
+top_genes$GENE_SYMBOL <- feature_data[rownames(top_genes), "GENE_SYMBOL"]
+# view the updated top_genes data frame with gene symbols
+print(head(top_genes))
+
+# now find EGFR 
+egfr_row <- top_genes[which(top_genes$GENE_SYMBOL == "EGFR"), ]
+print(egfr_row)
+```
+
+now clean up the top_genes data frame by setting the GENE_SYMBOL as rownames and removing the old rownames
+- this cannot be done directly because of duplicated gene symbols. 
+- for this reason i wan to extract all the gene_ids (rownames) corresponding to EGFR and then subset the top_genes data frame to include only those rows.
+```{r}
+egfr_rows_inds <- which(top_genes$GENE_SYMBOL == "EGFR")  # these are the row indices for EGFR
+print(egfr_rows_inds)
+# now extract the row names (gene ids) for these indices
+egfr_gene_ids <- rownames(top_genes)[egfr_rows_inds]
+print(egfr_gene_ids)
+```
+
+
+
+## construct a heat map for the top 30 differentially expressed genes
+this will include EGFR as well.
+```{r}
+library(pheatmap)
+library(RColorBrewer)
+# select the top 30 differentially expressed genes
+top30_genes <- rownames(top_genes)[1:30]
+# also include EGFR     
+top30_genes <- unique(c(top30_genes, egfr_gene_ids))
+# subset the filtered data to include only the top 30 genes
+heatmap_data <- filtered_data[top30_genes, ]
+# get the gene symbols for the top 30 genes
+gene_symbols_top30 <- feature_data[top30_genes, "GENE_SYMBOL"]
+# set the row names of the heatmap data to gene symbols
+rownames(heatmap_data) <- gene_symbols_top30
+
+# create annotation for the columns based on sample groups
+annotation_col <- data.frame(
+    Group = sample_groups$group
+)
+
+# set row names for annotation to match column names of heatmap data
+rownames(annotation_col) <- sample_groups$sample_name
+
+# create the heatmap
+pheatmap(
+  heatmap_data,
+  annotation_col = annotation_col,
+  main = "Heatmap of Top 30 Differentially Expressed Genes (GSE283536)",
+  fontsize_row = 8,
+  fontsize_col = 6,
+  
+  # --- Additions for consistency ---
+  scale = "row",          # z-scores the data, which is critical for visualization
+  cluster_cols = FALSE,   # Keeps your sample order (e.g., Untreated, then Osimertinib)
+  cluster_rows = TRUE,    # Clusters the genes
+  color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100), # Your usual color scheme
+  
+  # --- This is the corrected part ---
+  # filename, width, and height go *inside* the pheatmap() call
+  filename = file.path(save_box_path, "heatmap_top30_genes_GSE283536.png"),
+  width = 10,
+  height = 8
+) # <-- The final parenthesis goes here
+```
+
+## construct a volcano plot for the differential expression results
+include gene labels for EGFR 
+```{r}
+# --- 1. Load required libraries ---
+library(ggplot2)
+library(ggrepel)
+library(dplyr) # For the 'mutate' function
+
+# --- 2. Prepare the data ---
+# Your data is 'top_genes'.
+res_df <- top_genes
+
+# --- 3. Define thresholds ---
+lfc_threshold <- 1.0  # You had 1, but 1.5 is also common
+fdr_threshold <- 0.05
+
+# --- 4. Create the "class" column for coloring ---
+res_df <- res_df %>%
+  mutate(
+    # Clean the GENE_SYMBOL column just in case
+    GENE_SYMBOL_CLEAN = trimws(GENE_SYMBOL),
+    
+    # Create the 'class' column based on logFC and adj.P.Val
+    class = case_when(
+      logFC > lfc_threshold & adj.P.Val < fdr_threshold ~ "+",
+      logFC < -lfc_threshold & adj.P.Val < fdr_threshold ~ "-",
+      TRUE ~ "="
+    ),
+    # Make 'class' a factor to control the legend order
+    class = factor(class, levels = c("+", "-", "=")),
+    
+    # Create the label column. This will label all probes for EGFR.
+    gene_label = ifelse(GENE_SYMBOL_CLEAN == "EGFR", "EGFR", NA)
+  )
+
+# --- 5. Create the plot (new style) ---
+my_volcano_plot_gse283536 <- ggplot(res_df, aes(x = logFC, y = -log10(adj.P.Val))) +
+  
+  # Draw all points, colored by our new 'class' column
+  geom_point(aes(color = class), alpha = 0.7) +
+  
+  # Add text labels for the genes in 'gene_label' (i.e., all EGFR probes)
+  geom_text_repel(aes(label = gene_label),
+                  na.rm = TRUE,
+                  color = "black", # Make the label black
+                  box.padding = 0.5) +
+  
+  # Apply the colors
+  scale_color_manual(values = c("=" = "grey70", "+" = "firebrick3", "-" = "blue3")) +
+  
+  # Add the dashed threshold lines (using your thresholds)
+  geom_vline(xintercept = c(-lfc_threshold, lfc_threshold), linetype = "dashed", color = "grey20") +
+  geom_hline(yintercept = -log10(fdr_threshold), linetype = "dashed", color = "grey20") +
+  
+  # Add the theme
+  theme_bw() +
+  
+  # Add labs
+  labs(
+    title = "Volcano Plot: Osimertinib vs. Untreated (GSE283536)",
+    subtitle = paste("Significance: FDR <", fdr_threshold, "and |logFC| >", lfc_threshold),
+    x = "log2 Fold Change",
+    y = "-log10 (FDR)",
+    color = "Significance" # Adds a title to the legend
+  )
+
+# --- 6. Print the plot ---
+print(my_volcano_plot_gse283536)
+
+# --- 7. Save the plot ---
+ggsave(
+  filename = file.path(save_box_path, "volcano_plot_GSE283536.png"),
+  plot = my_volcano_plot_gse283536,
+  width = 10,
+  height = 8
+)
+```
+
+## export the result of the differential expression analysis containing the genesymbols to a tsv file
+```{r}
+# define the save path
+save_path_12 <- "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/assessing_mutation_frequency_EGFR_NSCLC/top_common_genes"
+# save the top_genes data frame as a tsv file
+write.table(top_genes, file = file.path(save_path_12, "GSE283536_DE_genes_with_symbols.tsv"), sep = "\t", row.names = TRUE, quote = FALSE)
+```
+
+     

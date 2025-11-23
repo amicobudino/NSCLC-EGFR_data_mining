@@ -1,0 +1,296 @@
+
+```{r}
+library(GEOquery)
+library(Biobase)
+library(tidyverse)
+library(limma)
+```
+## download the data from GEO
+```{r}
+save_path <- "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/data/RNA/expression_matrices/GSE202859"
+GSE202859 <- getGEOSuppFiles("GSE202859", makeDirectory = FALSE, baseDir = save_path)
+```
+
+## load the file
+```{r}
+# file is already unzipped
+file_path <- "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/data/RNA/expression_matrices/GSE202859/GSE202859_TPMs_allsamples.txt"
+# read the data
+expression_data <- read.delim(file_path, header = TRUE, row.names = 1)
+# check the dimensions of the data
+dim(expression_data)
+# check the first few rows of the data
+head(expression_data)
+```
+
+extract only the sample (columns) of the HCC827 cell line
+```{r}
+# get the column names
+colnames(expression_data)
+# select only the columns that contain "HCC827"
+hcc827_data <- expression_data %>% select(contains("HCC827"))
+# check the dimensions of the new data
+dim(hcc827_data)
+# check the first few rows of the new data
+head(hcc827_data)
+# check the structure
+str(hcc827_data)
+```
+
+the data is already in TPMs, so no need to normalize it further. jut compute the log2 transformation
+```{r}
+# 1. Convert the character data frame to a numeric matrix
+# We use 'sapply' to safely convert each column to numbers
+hcc827_numeric <- sapply(hcc827_data, as.numeric)
+
+# 2. Restore the row names (Gene IDs)
+# sapply returns a matrix but can lose row names, so we put them back
+rownames(hcc827_numeric) <- rownames(hcc827_data)
+
+# 3. Handle any NAs introduced during conversion
+# (If a cell had text like "Null", it becomes NA. We replace with 0)
+hcc827_numeric[is.na(hcc827_numeric)] <- 0
+
+# 4. NOW you can run the log transformation safely
+hcc827_log2 <- log2(hcc827_numeric + 1)
+
+# 5. Check the result - it should now show numbers, not "chr"
+print("Structure after fix:")
+str(hcc827_log2)
+
+print("First rows:")
+print(head(hcc827_log2))
+```
+
+## save the new data frame
+```{r}
+# save the data frame as a .rds file in the same directory
+saveRDS(hcc827_log2, file = file.path(save_path, "GSE202859_HCC827_TPMs_log2.rds"))
+```
+
+## now produce a boxplot of the log2 transformed data
+```{r}
+# convert the matrix to a data frame for ggplot
+hcc827_log2_df <- as.data.frame(hcc827_log2)
+# add a gene column for ggplot
+hcc827_log2_df$Gene <- rownames(hcc827_log2_df)
+# reshape the data to long format
+hcc827_long <- hcc827_log2_df %>% pivot_longer(cols = -Gene, names_to = "Sample", values_to = "Log2_TPM")
+# create the boxplot
+ggplot(hcc827_long, aes(x = Sample, y = Log2_TPM)) +
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+from the boxplot we can see that the data is well normalized across samples.
+
+## procede with differential expression analysis using limma
+
+first produce the design matrix with the conditions of interest:
+- pre treatment
+- post treatment 
+
+```{r}
+## procede with dea using limma
+
+# 1. Define the design and sample info safely
+# Ensure Condition is a factor with "Pre_Treatment" as the first (reference) level
+# This prevents the column order mix-up
+sample_info$Condition <- factor(sample_info$Condition, levels = c("Pre_Treatment", "Post_Treatment"))
+
+# Create the design matrix
+design <- model.matrix(~ 0 + Condition, data = sample_info)
+
+# Rename columns safely (now we know the order is Pre, then Post)
+colnames(design) <- c("Pre_Treatment", "Post_Treatment")
+print("Design Matrix:")
+print(design)
+
+# 2. FILTERING STEP (Crucial for preventing eBayes errors)
+# Ensure data is numeric matrix
+expr_matrix <- as.matrix(hcc827_log2)
+
+# Calculate variance and expression stats
+gene_variances <- apply(expr_matrix, 1, var)
+# Check if gene is expressed (Log2TPM > 1) in at least 2 samples
+is_expressed <- rowSums(expr_matrix > 1) >= 2
+
+# Define filter: Variance > 0 AND Expressed in at least 2 samples
+keep <- (gene_variances > 0) & is_expressed
+filtered_data <- expr_matrix[keep, ]
+
+print(paste("Original genes:", nrow(expr_matrix)))
+print(paste("Filtered genes:", nrow(filtered_data)))
+
+# 3. Run Limma on Filtered Data
+# fit the linear model
+fit <- lmFit(filtered_data, design)
+
+# create the contrast matrix
+contrast.matrix <- makeContrasts(Post_vs_Pre = Post_Treatment - Pre_Treatment, levels = design)
+
+# fit the contrasts
+fit2 <- contrasts.fit(fit, contrast.matrix)
+
+# apply empirical Bayes moderation
+fit2 <- eBayes(fit2)
+
+# get the top differentially expressed genes
+topTable_results <- topTable(fit2, adjust.method = "BH", number = Inf)
+
+# view the results
+head(topTable_results)
+```
+
+## now extract the gene names and put them in a new column called "gene_sym"
+
+at the moment the row names of the data contain a string with both Gene id and gene symbol separated by a "|". 
+now take the row names and split the string at the "|" character and extract both the gene is 
+and the gene symbol and put them in two new columns called "gene_id" and "gene_sym"
+```{r}
+library(dplyr)
+library(tidyr)
+library(tibble)
+
+# 1. Convert rownames to a column, then split
+topTable_results <- topTable_results %>%
+  tibble::rownames_to_column(var = "Gene_Info") %>%
+  separate(Gene_Info, 
+           into = c("gene_id", "gene_sym"), 
+           sep = "\\|", 
+           extra = "merge", # If there are extra parts, merge them into the last column
+           fill = "right")  # If parts are missing, fill with NA on the right
+
+# 2. (Optional) Clean up any whitespace
+topTable_results$gene_sym <- trimws(topTable_results$gene_sym)
+topTable_results$gene_id <- trimws(topTable_results$gene_id)
+
+# 3. Check the results
+head(topTable_results)
+```
+
+now extract the results for EGFR, where in the gene_sym column i find "EGFR"
+
+```{r}
+egfr_results <- topTable_results %>% filter(gene_sym == "EGFR")
+# view the results for EGFR
+print(egfr_results)
+```
+
+          gene_id gene_sym     logFC  AveExpr        t      P.Value      adj.P.Val        B
+1 ENSG00000146648     EGFR -2.548317 9.075807 -15.2799 2.724419e-06   7.111548e-05 5.310147
+
+
+## heatmap of the top 30 differentially expressed genes including EGFR in nor present already
+
+```{r}
+library(pheatmap)
+library(RColorBrewer)
+library(dplyr)
+library(tibble)
+
+# 1. get top 30 by adjusted p-value and ensure EGFR included if present in results
+top_genes_tbl <- topTable_results %>% arrange(adj.P.Val) %>% slice_head(n = 30)
+
+egfr_row <- topTable_results %>% filter(gene_sym == "EGFR")
+if(nrow(egfr_row) > 0 && ! any(top_genes_tbl$gene_id == egfr_row$gene_id)){
+  top_genes_tbl <- bind_rows(top_genes_tbl, egfr_row) %>% distinct(gene_id, .keep_all = TRUE)
+}
+
+selected_ids <- top_genes_tbl$gene_id
+
+# 2. map expression rows to gene_id (text before '|') and subset filtered_data
+rownames_gene_id <- sub("\\|.*", "", rownames(filtered_data))
+keep_idx <- which(rownames_gene_id %in% selected_ids)
+expr_subset <- filtered_data[keep_idx, , drop = FALSE]
+
+# 3. set rownames to gene symbols when available (fallback to gene_id)
+id2sym <- topTable_results %>% select(gene_id, gene_sym) %>% distinct(gene_id, .keep_all = TRUE)
+sym_map <- setNames(ifelse(is.na(id2sym$gene_sym) | id2sym$gene_sym == "", id2sym$gene_id, id2sym$gene_sym), id2sym$gene_id)
+rownames(expr_subset) <- sym_map[sub("\\|.*", "", rownames(expr_subset))]
+
+# 4. scale rows (z-score) for visualization
+expr_scaled <- t(scale(t(expr_subset)))
+
+# 5. prepare sample annotation if sample_info available and matches columns
+annotation_col <- NULL
+if(exists("sample_info")){
+  ann <- sample_info
+  if("Sample" %in% colnames(ann)){
+    ann <- ann %>% column_to_rownames("Sample")
+  }
+  if(all(colnames(expr_scaled) %in% rownames(ann))){
+    annotation_col <- ann[colnames(expr_scaled), , drop = FALSE]
+  }
+}
+
+# 6. draw heatmap
+my_palette <- colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu")))(100)
+
+pheatmap(expr_scaled,
+         color = my_palette,
+         cluster_rows = TRUE,
+         cluster_cols = FALSE,
+         show_rownames = TRUE,
+         show_colnames = TRUE,
+         fontsize_row = 8,
+         fontsize_col = 8,
+         annotation_col = annotation_col,
+         main = "Top DE genes (incl. EGFR) — scaled TPM (log2)")
+```
+
+## volcanoplot of the differential expression results
+point out EGFR in the plot
+
+```{r}
+library(ggplot2)
+# ggrepel used for non-overlapping labels if available
+# dplyr is already loaded earlier; use it here
+volc_df <- topTable_results %>%
+  mutate(logP = -log10(P.Value),
+         signif = (adj.P.Val < 0.05 & abs(logFC) > 1))
+
+# Choose labels: always include EGFR if present, plus up to 4 top significant genes
+label_genes <- volc_df %>% filter(gene_sym == "EGFR")
+if(nrow(label_genes) == 0){
+  label_genes <- volc_df %>% filter(signif) %>% arrange(adj.P.Val) %>% slice_head(n = 5)
+} else {
+  extra <- volc_df %>% filter(signif, gene_sym != "EGFR") %>% arrange(adj.P.Val) %>% slice_head(n = 4)
+  label_genes <- bind_rows(label_genes, extra) %>% distinct(gene_sym, .keep_all = TRUE)
+}
+
+# Basic volcano plot
+p <- ggplot(volc_df, aes(x = logFC, y = logP)) +
+  geom_point(aes(color = signif), alpha = 0.6, size = 1.6) +
+  scale_color_manual(values = c("FALSE" = "grey60", "TRUE" = "red")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "blue", size = 0.3) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "blue", size = 0.3) +
+  xlab("log2 Fold Change") + ylab("-log10(P-value)") +
+  ggtitle("Volcano plot — Post vs Pre") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Add labels: prefer ggrepel if available, otherwise geom_text
+if(requireNamespace("ggrepel", quietly = TRUE)){
+  p <- p + ggrepel::geom_text_repel(data = label_genes, aes(label = gene_sym),
+                                    size = 3, max.overlaps = 20)
+} else {
+  p <- p + geom_text(data = label_genes, aes(label = gene_sym),
+                     vjust = -0.5, size = 3)
+}
+
+print(p)
+```
+
+## for the meta analyisis i will save the results as a .csv file
+in particular save the all the differentially expressed genes in a .tsv file
+
+
+```{r}
+output_dir <- "/Users/alvise/Documents/uni/semestre3/laboratory_bio_datamining/assessing_mutation_frequency_EGFR_NSCLC/top_common_genes"
+# select top 1000 genes by adjusted p-value
+top_results <- topTable_results
+write.table(top_results, file = file.path(output_dir, "GSE202859_DE_results_with_symbols.tsv"), sep = "\t", row.names = FALSE)
+```
+
+## 
